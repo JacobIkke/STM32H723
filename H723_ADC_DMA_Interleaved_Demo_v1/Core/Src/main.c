@@ -22,6 +22,20 @@
   * The STM32H723 microcontroller features both fast and slow ADC channels. In this example, we use the fast channels
   * for better performance.
   *
+  * We will use the following modules and pins:
+  * - ADC1: pin ADC1_INP3 PA6
+  * - ADC2: pin ADC2_INP3 PA6
+  * - TIM6
+  * - DMA
+  * - UART1: pins PA9 and PA10
+  *
+  * According to Table 12 in the reference manual, "Maximum ADC frequency versus package type (VREF=VDDA=3 V, T=25°C)":
+  * - In this case, with an LQFP100 package, 16-bit resolution, and two ADCs, the maximum recommended frequency is 19 MHz.
+  * - The ADC clock is set to 38 MHz via the PLL, with an ADC prescaler of 2, resulting in the ADC running at 19 MHz.
+  *
+  * Note: I've tested ADC at higher clocks and seems pretty stable, so maybe there is lots of headroom.
+  *
+  *
   * The fast channels for STM32H723 ADC12 (ADC12 = ADC1 + ADC2) are:
   * - ADC12_INP0 PC2_C
   * - ADC12_INP1 PC3_C
@@ -36,18 +50,25 @@
   * Note: Other H7 microcontrollers may have different channel configurations, and there are slow channels that support
   * interleaved mode as well.
   *
-  * We will use the following modules and pins:
-  * - ADC1: pin ADC1_INP3 PA6
-  * - ADC2: pin ADC2_INP3 PA6
-  * - TIM6
-  * - DMA
-  * - UART1: pins PA9 and PA10
   *
+  * Timer 6 triggers the ADC conversions, running at 1 MHz:
+  * - AHB4 peripheral = 250 MHz
+  * - Prescaler = 0
+  * - Counter Period = 250
+  * - Calculation: 250,000,000 Hz / 250 = 1,000,000 Hz
+  *
+  * According to the STM32H723 documentation, H7 ADC conversion time is calculated differently:
+  * - tconversion = tsampling + N/2 + 0.5
+  * - tsampling = 2.5 (sampling time in cycles)
+  * - ADC bits = 16-bit
+  * - Calculation: 2.5 + 16/2 + 0.5 = 11 clock cycles
+  * - but we use interleaved, with 2.5 delay between second sampling, so we get final 13.5 as final
+  *
+  * With an 18MHz ADC clock and a conversion time of 13.5, the maximum dual interleaved sampling rate is approximately 1.33 MSPS.
+  * We trigger the ADC conversion with timer 6, which runs at 1 MHz. The ADC samples at rate of 1.33 MHz to ensure it's ready when the next timer trigger occurs.
   *
   * You can find the maximum sampling speed in application note AN5354, section 4.2 Dual ADC operation.
   */
-
-
 
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
@@ -102,13 +123,8 @@ static void MX_ADC2_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#define buffer_size 128
-uint32_t ADC_buf1[buffer_size];
-
-//__attribute__((aligned(32))) uint32_t ADC_12bit_buf2[buffer_size];
-
-// global variables
-
+#define buffer_size 64			// Number of ADC samples
+uint32_t ADC_buf[buffer_size]; 	// ADC result buffer
 /* USER CODE END 0 */
 
 /**
@@ -157,6 +173,9 @@ int main(void)
 
   printf("STM32H723 ADC interleaved DMA Demo v1.0 \n");
 
+  // The STM32H7 embeds a linearity calibration engine to enhance the ADC linearity. It allows compensation of
+  // capacitance mismatch during production.
+
   // Calibrate ADC1 with linearity offset in single-ended mode
   if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET_LINEARITY, ADC_SINGLE_ENDED) != HAL_OK) {
       Error_Handler(); // Handle calibration error for ADC1
@@ -168,7 +187,7 @@ int main(void)
   }
 
   // Start the multi-mode ADC DMA transfer for ADC1
-  if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&ADC_buf1, buffer_size) != HAL_OK) {
+  if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&ADC_buf, buffer_size) != HAL_OK) {
       printf("ADC MM DMA Error \n"); // Print error message for ADC multi-mode DMA start failure
       Error_Handler(); // Handle DMA start error for multi-mode ADC
   }
@@ -191,25 +210,27 @@ int main(void)
 		__NOP(); // No Operation: wait here
 	}
 
-	// Read the DMA buffer, interleaving the values: store ADC1 value in lower 16 bits and ADC2 value in upper 16 bits
+	// Print the results that are stored in the 32-bit DMA buffer, ADC_buf.
+	// The interleaved values are arranged such that each 32-bit variable holds two ADC results,
+	// with the lower 16 bits containing the first ADC result and the upper 16 bits containing the second ADC result.
 	for(int i = 0; i < buffer_size; i++) {
-		if(i % 32 == 0) {
-			printf("\n"); // New line for every 32 values for better readability
+		if(i % 8 == 0) {
+			printf("\n"); // New line for every 8 values for better readability
 		}
-		printf("%04i ", (uint16_t)ADC_buf1[i]);        // Print ADC1 value
-		printf("%04i ", (uint16_t)(ADC_buf1[i] >> 16)); // Print ADC2 value
+		printf("%05i ", (uint16_t)ADC_buf[i]);        	// Print 16bit ADC result 1
+		printf("%05i ", (uint16_t)(ADC_buf[i] >> 16)); 	// Print 16bit ADC result 2
 	}
 	printf("\n");
 
 	// Restart the DMA multi-mode transfer for the next set of readings
-	if(HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&ADC_buf1, buffer_size) != HAL_OK) {
+	if(HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)&ADC_buf, buffer_size) != HAL_OK) {
 		printf("ADC MM DMA Error \n"); // Print error message for ADC multi-mode DMA start failure
 		Error_Handler(); // Handle DMA start error for multi-mode ADC
 	}
 
-	// Toggle the LED and delay to indicate the code is running
-	HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_3); // Toggle LED connected to GPIO pin
-	HAL_Delay(1000); // Delay for 1000 ms (1 second)
+	// Toggle the LED to indicate the code is running. And some delay.
+	HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_3); 	// Toggle LED connected to GPIO pin
+	HAL_Delay(1000); 						// Delay for 1000 ms (1 second)
 
     /* USER CODE END WHILE */
 
@@ -240,10 +261,8 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
-  RCC_OscInitStruct.HSICalibrationValue = 64;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 2;
@@ -276,10 +295,6 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-
-  /** Enables the Clock Security System
-  */
-  HAL_RCC_EnableCSS();
 }
 
 /**
@@ -292,8 +307,16 @@ void PeriphCommonClock_Config(void)
 
   /** Initializes the peripherals clock
   */
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_CKPER;
-  PeriphClkInitStruct.CkperClockSelection = RCC_CLKPSOURCE_HSI;
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInitStruct.PLL3.PLL3M = 2;
+  PeriphClkInitStruct.PLL3.PLL3N = 24;
+  PeriphClkInitStruct.PLL3.PLL3P = 2;
+  PeriphClkInitStruct.PLL3.PLL3Q = 2;
+  PeriphClkInitStruct.PLL3.PLL3R = 8;
+  PeriphClkInitStruct.PLL3.PLL3RGE = RCC_PLL3VCIRANGE_3;
+  PeriphClkInitStruct.PLL3.PLL3VCOSEL = RCC_PLL3VCOWIDE;
+  PeriphClkInitStruct.PLL3.PLL3FRACN = 2950;
+  PeriphClkInitStruct.AdcClockSelection = RCC_ADCCLKSOURCE_PLL3;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -322,7 +345,7 @@ static void MX_ADC1_Init(void)
   /** Common config
   */
   hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV8;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
   hadc1.Init.Resolution = ADC_RESOLUTION_16B;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
@@ -391,7 +414,7 @@ static void MX_ADC2_Init(void)
   /** Common config
   */
   hadc2.Instance = ADC2;
-  hadc2.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV8;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
   hadc2.Init.Resolution = ADC_RESOLUTION_16B;
   hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
@@ -447,7 +470,7 @@ static void MX_TIM6_Init(void)
   htim6.Instance = TIM6;
   htim6.Init.Prescaler = 0;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 32;
+  htim6.Init.Period = 250;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
@@ -561,11 +584,10 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
-
-	HAL_ADCEx_MultiModeStop_DMA(&hadc1);
-	printf("ADC DMA transfer is Ready \n"); // Optional serial output for debugging
+	HAL_ADCEx_MultiModeStop_DMA(&hadc1); // We stop the DMA transfer so we can compute the data that we received in the adc_buf[] buffer
 }
 
+// prototype for the printf and simular functions
 PUTCHAR_PROTOTYPE{
   HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
   return ch;
